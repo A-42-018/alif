@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# GitDrip CLI dispatcher.
+set -euo pipefail
+
+_src="${BASH_SOURCE[0]}"
+while [[ -L "$_src" ]]; do
+  _dir="$(cd -P "$(dirname "$_src")" && pwd)"
+  _src="$(readlink "$_src")"
+  [[ "$_src" != /* ]] && _src="$_dir/$_src"
+done
+GITDRIP_APP="$(cd -P "$(dirname "$_src")/.." && pwd)"
+
+# shellcheck source=../lib/common.sh
+source "$GITDRIP_APP/lib/common.sh"
+# shellcheck source=../lib/logger.sh
+source "$GITDRIP_APP/lib/logger.sh"
+# shellcheck source=../lib/manifest.sh
+source "$GITDRIP_APP/lib/manifest.sh"
+# shellcheck source=../lib/batch.sh
+source "$GITDRIP_APP/lib/batch.sh"
+# shellcheck source=../lib/git.sh
+source "$GITDRIP_APP/lib/auth.sh"
+# shellcheck source=../lib/github.sh
+source "$GITDRIP_APP/lib/github.sh"
+# shellcheck source=../lib/scan.sh
+source "$GITDRIP_APP/lib/scan.sh"
+# shellcheck source=../lib/git.sh
+source "$GITDRIP_APP/lib/git.sh"
+# shellcheck source=../lib/runner.sh
+source "$GITDRIP_APP/lib/runner.sh"
+# shellcheck source=../lib/backup.sh
+source "$GITDRIP_APP/lib/backup.sh"
+# shellcheck source=../lib/retry.sh
+source "$GITDRIP_APP/lib/retry.sh"
+# shellcheck source=../lib/schedule.sh
+source "$GITDRIP_APP/lib/schedule.sh"
+# shellcheck source=../lib/prflow.sh
+source "$GITDRIP_APP/lib/prflow.sh"
+# shellcheck source=../lib/bridge.sh
+source "$GITDRIP_APP/lib/bridge.sh"
+
+usage() {
+  cat <<USAGE
+GitDrip $GITDRIP_VERSION — real, steady commits from Termux
+
+Usage: gitdrip <command> [args]
+
+Commands:
+  log <msg...>            Append INFO line to logs/execution.log
+  logs [-n N]             Show last N log lines (default 20)
+  config get <key>        Print a config value
+  config set <key> <val>  Set a config value (needs jq)
+  config export <file>|import <file>   Share config (import applies known keys only; needs jq)
+  backup [file] [--full]  tar.gz of config, schedules, batches, tasks (never the token)
+  restore <file> [--force]   Restore a backup (validated; refuses links/unsafe paths)
+  config show             Print config.json
+  import <dir> [--name N] [--max N]  Copy project, build manifest + batches
+  batch-create <project> [--max N]   (Re)generate batches.json (default max 5 files)
+  batches <project>       List batches + commits available
+  projects                List imported projects
+  repo-init <p> [--remote URL] [--branch B] [--user N] [--email E]
+                          Create/configure the project's git repo
+  run-batch <p> <id> [--dry] [--no-push]
+                          Commit (+push) one batch; no change = STOP
+  git-status <p>          Show repo branch/remote/identity/changes
+  run <p> [batch-id]      Create + run a task for the next (or given) batch
+  task-create <p> [id]    Create a task, print task_id (reuses an open one)
+  task-run <task_id> [--now]  Run a task (idempotent; lock + state machine; --now ignores retry timer)
+  retry-due [--list]      Run tasks in PENDING_RETRY whose retry time has come
+  net-check <p>           Probe connectivity to the project's remote (exit 1 = offline)
+  tasks [project]         List tasks
+  task-show <task_id>     Print task JSON
+  auth set --user NAME    Store GitHub token (read from stdin, chmod 600)
+  auth status|clear       Show (masked) / remove stored credentials
+  scan <project|dir>      Secret scan; exit 1 on hits (never prints secrets)
+  preflight <p>           Contribution-eligibility checks for a project's repo
+  schedule add "HH:MM" <p> [--policy skip|run-now|next-slot]   Add daily slot (updates crontab)
+  schedule list|remove <id>|enable <id>|disable <id>|install|uninstall|next
+  schedule fire <id>      Run the slot now (cap-aware); cron calls this
+  schedule tick           Retries due + missed-slot policy (cron every 5 min)
+  github whoami|repos|branches <o/r>|check <o/r>|create <name> [--public] [--desc T]
+                          GitHub API (JSON out); create needs config allow_create_repo=true (default off)
+  issue create <o/r> --title T [--body B]
+  pr open <o/r> --head BR --title T [--base BR] [--body B] | pr merge <o/r> <n> [--method squash|merge|rebase]
+  pr-flow <p> <batch-id> [--issue] [--merge] [--method M] [--dry]
+                          Batch commit on branch gitdrip/<project>-batch-<id> -> push -> [issue] -> PR -> [merge]; rerun resumes
+  bridge <req> doctor|sync <p>|run <p> [batch-id] [--sync]|status <p>|history <p>
+                          Android app bridge: writes results/<req>.json in the shared GitDrip dir
+  bridge <req> auth-handoff <user> <key64hex>
+                          One-time encrypted token handoff from the app (reads <exchange>/handoff/<req>.enc)
+  bridge <req> gh-validate|gh-repos|gh-branches <o/r>|gh-check <o/r>|gh-create <name> [--public]
+                          Same, for the GitHub API (result in .data)
+  doctor                  Check dependencies and paths
+  version                 Print version
+  --help, -h              Show this help
+
+Env:
+  GITDRIP_HOME            Data dir (default: ~/.gitdrip)
+  GITDRIP_EXCHANGE        App exchange dir (default: ~/storage/shared/GitDrip)
+
+Android app: see android/ and plan.md
+USAGE
+}
+
+cmd_logs() {
+  local n=20
+  if [[ "${1:-}" == "-n" ]]; then n="${2:-20}"; fi
+  [[ -f "$GITDRIP_LOG_FILE" ]] || { echo "(no log yet)"; return 0; }
+  tail -n "$n" "$GITDRIP_LOG_FILE"
+}
+
+cmd_config() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    get)  [[ $# -ge 1 ]] || die "usage: gitdrip config get <key>"; config_get "$1"; echo ;;
+    set)  [[ $# -ge 2 ]] || die "usage: gitdrip config set <key> <value>"
+          config_set "$1" "$2"; log_info "config set $1"; ;;
+    export) config_export "$@" ;;
+    import) config_import "$@" ;;
+    show) [[ -f "$GITDRIP_CONFIG" ]] && cat "$GITDRIP_CONFIG" || die "config missing; run install.sh" ;;
+    *)    die "usage: gitdrip config {get|set|show|export|import}" ;;
+  esac
+}
+
+cmd_doctor() {
+  local ok=0 t
+  echo "home:   $GITDRIP_HOME"
+  echo "app:    $GITDRIP_APP"
+  for t in git curl jq crond; do
+    if have "$t"; then echo "[ok]   $t"; else echo "[miss] $t"; [[ "$t" == crond ]] || ok=1; fi
+  done
+  [[ -f "$GITDRIP_CONFIG" ]] && echo "[ok]   config.json" || { echo "[miss] config.json"; ok=1; }
+  [[ -d "$GITDRIP_LOG_DIR" ]] && echo "[ok]   logs/" || { echo "[miss] logs/"; ok=1; }
+  return "$ok"
+}
+
+cmd_import() {
+  local src="" name="" max="" force=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name) name="${2:-}"; shift 2 ;; --max) max="${2:-}"; shift 2 ;; --force) force=1; shift ;;
+      *) src="$1"; shift ;;
+    esac
+  done
+  [[ -n "$src" && -d "$src" ]] || die "usage: gitdrip import <dir> [--name N] [--max N] [--force]"
+  src="$(cd -P "$src" && pwd)"
+  name="$(slugify "${name:-$(basename "$src")}")"; [[ -n "$name" ]] || die "invalid project name"
+  local pd; pd="$(project_dir "$name")"
+  if [[ -d "$pd" ]]; then
+    [[ $force -eq 1 ]] || die "project '$name' exists (use --force to re-import)"
+    if [[ -f "$pd/batches.json" ]] && jq -e '[.batches[]|select(.status!="PENDING")]|length>0' "$pd/batches.json" >/dev/null 2>&1; then
+      die "project '$name' has executed batches; refusing re-import"
+    fi
+    rm -rf "$pd"
+  fi
+  project_import "$src" "$name"
+  manifest_generate "$name"
+  batch_create "$name" "$max"
+}
+
+cmd_projects() {
+  local d n; [[ -d "$GITDRIP_HOME/projects" ]] || { echo "(none)"; return 0; }
+  for d in "$GITDRIP_HOME/projects"/*/; do
+    [[ -d "$d" ]] || { echo "(none)"; return 0; }
+    n="$(basename "$d")"
+    printf '%s\t%s files\n' "$n" "$(jq -r '.file_count // 0' "$d/manifest.json" 2>/dev/null || echo 0)"
+  done
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    ""|-h|--help|help) usage ;;
+    version|--version|-v) echo "gitdrip $GITDRIP_VERSION" ;;
+    log)    [[ $# -ge 1 ]] || die "usage: gitdrip log <message>"; ensure_dirs; log_info "$*" ;;
+    logs)   cmd_logs "$@" ;;
+    config) ensure_dirs; cmd_config "$@" ;;
+    import) ensure_dirs; cmd_import "$@" ;;
+    batch-create) [[ $# -ge 1 ]] || die "usage: gitdrip batch-create <project> [--max N]"
+          local p="$1"; shift; [[ "${1:-}" == "--max" ]] && batch_create "$p" "${2:-}" || batch_create "$p" ;;
+    batches) [[ $# -ge 1 ]] || die "usage: gitdrip batches <project>"; batch_list "$1" ;;
+    projects) cmd_projects ;;
+    backup) ensure_dirs; backup_create "$@" ;;
+    restore) backup_restore "$@" ;;
+    repo-init) [[ $# -ge 1 ]] || die "usage: gitdrip repo-init <project> [--remote URL] [--branch B] [--user N] [--email E]"
+          ensure_dirs; git_repo_init "$@" ;;
+    run-batch) [[ $# -ge 2 ]] || die "usage: gitdrip run-batch <project> <batch-id> [--dry] [--no-push]"
+          ensure_dirs; git_run_batch "$@" ;;
+    run) [[ $# -ge 1 ]] || die "usage: gitdrip run <project> [batch-id]"; ensure_dirs; task_run_next "$@" ;;
+    task-create) [[ $# -ge 1 ]] || die "usage: gitdrip task-create <project> [batch-id]"; ensure_dirs
+          local _r=0; task_create "$@" || _r=$?; [[ $_r -ne 5 ]] || echo "no pending batches for $1" >&2; exit "$_r" ;;
+    task-run) [[ $# -ge 1 ]] || die "usage: gitdrip task-run <task_id>"; ensure_dirs; task_run "$@" ;;
+    retry-due) ensure_dirs; retry_due "$@" ;;
+    net-check) [[ $# -ge 1 ]] || die "usage: gitdrip net-check <project>"; if net_online "$1"; then echo online; else echo offline; exit 1; fi ;;
+    tasks) task_list "$@" ;;
+    task-show) [[ $# -ge 1 ]] || die "usage: gitdrip task-show <task_id>"; task_show "$1" ;;
+    git-status) [[ $# -ge 1 ]] || die "usage: gitdrip git-status <project>"; git_status "$1" ;;
+    auth) ensure_dirs; case "${1:-}" in set) shift; auth_set "$@" ;; status) auth_status ;; clear) auth_clear ;; *) die "usage: gitdrip auth {set --user NAME|status|clear}" ;; esac ;;
+    credential-helper) auth_credential_helper "$@" ;;
+    scan) [[ $# -ge 1 ]] || die "usage: gitdrip scan <project|dir>"
+          local _d="$1" _rc=0; [[ -d "$_d" ]] || _d="$(project_dir "$1")/source"; [[ -d "$_d" ]] || die "unknown project or dir: $1"
+          scan_dir "$_d" || _rc=$?; [[ $_rc -eq 0 ]] || echo "potential secrets found" >&2; exit "$_rc" ;;
+    preflight) [[ $# -ge 1 ]] || die "usage: gitdrip preflight <project>"; git_preflight_report "$1" ;;
+    schedule) ensure_dirs; local _sc="${1:-}"; shift || true
+          case "$_sc" in
+            add) schedule_add "$@" ;; list) schedule_list ;; remove) schedule_remove "$@" ;;
+            enable) schedule_enable "${1:-}" true ;; disable) schedule_enable "${1:-}" false ;;
+            install) schedule_install ;; uninstall) schedule_uninstall ;; next) schedule_next ;;
+            fire) schedule_fire "$@" ;; tick) schedule_tick ;;
+            *) die "usage: gitdrip schedule {add|list|remove|enable|disable|install|uninstall|next|fire|tick}" ;;
+          esac ;;
+    github) ensure_dirs; local _g="${1:-}"; shift || true
+          case "$_g" in
+            whoami) gh_whoami ;; repos) gh_repos ;; identity) gh_identity ;;
+            branches) [[ $# -ge 1 ]] || die "usage: gitdrip github branches <owner/repo>"; gh_branches "$1" ;;
+            check) [[ $# -ge 1 ]] || die "usage: gitdrip github check <owner/repo>"; gh_repo_check "$1" ;;
+            create) [[ $# -ge 1 ]] || die "usage: gitdrip github create <name> [--public] [--desc TEXT]"; gh_create_repo "$@" ;;
+            *) die "usage: gitdrip github {whoami|repos|branches <o/r>|check <o/r>|create <name>}" ;;
+          esac ;;
+    issue) ensure_dirs; cmd_issue "$@" ;;
+    pr) ensure_dirs; cmd_pr "$@" ;;
+    pr-flow) ensure_dirs; prflow_run "$@" ;;
+    bridge) bridge_main "$@" ;;
+    doctor) cmd_doctor ;;
+    *)      echo "gitdrip: unknown command '$cmd'" >&2; usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"
