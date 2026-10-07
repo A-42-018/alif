@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "log_level": "INFO",
+  "log_max_bytes": 1048576,
+  "default_branch": "main",
+  "max_commits_per_day": 3,
+  "batch_max_files": 5,
+  "lock_stale_minutes": 30,
+  "dry_run": false,
+  "allow_create_repo": false,
+  "missed_grace_minutes": 10,
+  "retry_backoff_minutes": "0,2,5,15",
+  "timezone": "UTC"
+}
